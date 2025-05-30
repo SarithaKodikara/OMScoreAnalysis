@@ -1,6 +1,6 @@
 This vignette provides all reproducible codes for our article:
 
-# Oral microbial signatures of head and neck cancer patients with diverse longitudinal disease severity patterns
+# Oral microbial signatures of head and neck cancer patients with diverse longitudinal oral mucositis severity patterns
 Jiadong Mao, Saritha Kodikara, Erin Marie D San Valentin, Kim-Anh Do, Cielito C. Reyes-Gibby, Kim-Anh L\^e Cao
 
 **Abstract:**
