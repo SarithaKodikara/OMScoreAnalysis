@@ -9,8 +9,7 @@ library(RColorBrewer)
 
 #### Reading Data ####
 meta_raw <- read.csv('data/patientdata_3obs_allresponses.csv', row.names=1) 
-otu_data<- read.csv('data/OTU_table.csv', row.names=1)%>%t()
-rownames(otu_data) <- gsub("Gibby.|Reyes.", "", rownames(otu_data))
+otu_data<- read.csv('data/OTU_table.csv', row.names=1) %>%t()
 
 ########### Filtering meta data ############
 
