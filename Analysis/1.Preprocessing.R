@@ -65,6 +65,13 @@ OTUtoKeep<-t(apply(OTU_data,1, function(x) x/sum(x))) %>%
 # Keep only the OTUs that have a mean relative abundance of at least 0.01%
 OTU_filtered_counts<-OTU_data[,OTUtoKeep]
 
+# Calculate % of data mass removed
+#  calculates the fraction of data kept (sum(data_filtered) / sum(data)).
+#  subtracts this from 1 to get the fraction removed then multiplies by 100 to get %
+
+pct_removed <- (1 - sum(OTU_filtered_counts, na.rm=TRUE) / sum(OTU_data, na.rm=TRUE)) * 100
+cat(sprintf("Total count mass removed: %.2f%%\n", pct_removed))
+
 # Convert the OTU counts to clr transformed data
 OTU_filtered_clr <- logratio.transfo(as.matrix(OTU_filtered_counts), 
                                      logratio = 'CLR', offset = 1)
