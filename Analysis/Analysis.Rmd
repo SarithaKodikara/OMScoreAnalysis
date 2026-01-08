@@ -165,9 +165,26 @@ X2clust <- as.matrix(distM)
 
 #number of clusters according to Gap statistics
 set.seed(8790)
-gap_stat <- clusGap(X2clust, hcut, K.max=10, B = 100)
-gapRes <- fviz_gap_stat(gap_stat)
-gapRes
+#gap_stat <- clusGap(X2clust, hcut, K.max=10, B = 100)
+#fviz_nbclust(X2clust, method = "gap_stat", FUN=hcut)
+```
+```{r}
+# From the plot, we choose k = 3  
+
+fviz_nbclust(X2clust, method = "gap_stat", FUN=hcut)
+ggsave("figs/gap_stat.png", width = 4, height = 3)
+```
+
+```{r}
+
+fviz_nbclust(X2clust, method = "silhouette", FUN=hcut) 
+ggsave("figs/silhouette_stat.png", width = 4, height = 3)
+```
+
+```{r}
+
+fviz_nbclust(X2clust, method = "wss", FUN=hcut)
+ggsave("figs/wss_stat.png", width = 4, height = 3)
 ```
 
 ```{r}
@@ -198,6 +215,125 @@ ggplot(metaDat_c, aes(x = timepoint, y = OMscore_calib, color = cluster, group =
     scale_color_manual(values = carto_pal(n=5, "Safe")) 
   
 metaDat_c%>% select(id, cluster) %>% unique()%>%select(cluster)%>%table()
+```
+
+## Testing for differences in duration of follow-up across patient clusters
+```{r}
+duration_df <- metaDat_c %>%
+    group_by(id) %>%
+    reframe(
+        end_time = max(timepoint, na.rm = TRUE),
+        duration = max(timepoint, na.rm = TRUE) - min(timepoint, na.rm = TRUE),
+        cluster = cluster
+    )%>% unique()
+
+duration_df$cluster <- factor(duration_df$cluster)
+
+```
+
+```{r}
+## ----------------------------
+## Pairwise Wilcoxon test
+## ----------------------------
+pw <- pairwise.wilcox.test(
+  duration_df$duration,
+  duration_df$cluster,
+  p.adjust.method = "BH",
+  exact = FALSE
+)
+pw
+```
+```{r}
+## ----------------------------
+## Plot with p-value annotations
+## ----------------------------
+pvals_df <- as.data.frame(pw$p.value) %>%
+  rownames_to_column("group1") %>%
+  pivot_longer(
+    cols = -group1,
+    names_to = "group2",
+    values_to = "p.adj"
+  ) %>%
+  filter(!is.na(p.adj))
+
+y_max <- max(duration_df$duration, na.rm = TRUE)
+
+pvals_df <- pvals_df %>%
+  mutate(
+    y.position = y_max * (1.05 + 0.1 * row_number()),
+    #label = paste0("p = ", signif(p.adj, 2))
+    label= case_when(
+              p.adj < 0.001 ~ "***",
+              p.adj < 0.01  ~ "**",
+              p.adj < 0.05  ~ "*",
+               TRUE          ~ "ns")
+  )
+
+
+ggplot(duration_df, aes(x = cluster, y = duration)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  stat_pvalue_manual(
+    pvals_df,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position"
+  ) +
+  labs(
+    x = "Cluster",
+    y = "Observation duration (days)"
+  ) +
+  theme_minimal()
+ggsave("figs/boxplots_duration.png", width = 5, height = 4)
+```
+
+## Sensitivity of clustering if we cut the curves at day 48
+
+```{r}
+summary(duration_df$end_time)
+#duration_df%>%filter(cluster==3)%>%summarise(median=median(duration))
+
+
+#histogram of end time  with mean as a line
+median_end_time <- median(duration_df$end_time)
+ggplot(duration_df, aes(x = end_time)) +
+  geom_histogram(binwidth = 5, fill = "lightblue", color = "grey") +
+  geom_vline(
+    xintercept = median_end_time,
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  annotate(
+    "text",
+    x = median_end_time,
+    y = Inf,
+    label = paste0("Median = ", round(median_end_time, 1)),
+    vjust = 1.5,
+    hjust = -0.1,
+    color = "black"
+  ) +
+  labs(
+    x = "Last time point (days)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+ggsave("figs/histogram_last_timepoint.png", width = 4, height = 3)
+```
+```{r}
+
+# Cut the curves at day 48
+X_cut <- X[,1:which(timeGrid == 41)]
+
+distM_new <- distMiss(X_cut)
+X2clust_new <- as.matrix(distM_new)
+
+
+k <- 3
+clusters_new <- hcut(X2clust_new, k = k)$cluster
+table(clusters, clusters_new)
 ```
 
 
@@ -524,5 +660,7 @@ dev.off()
 ```
 
 
-
+```{r}
+sessionInfo()
+```
 
