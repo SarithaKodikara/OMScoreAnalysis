@@ -1,0 +1,993 @@
+---
+title: "Oral microbial signatures of head and neck cancer patients with diverse longitudinal disease severity patterns"
+author: "Jiadong Mao, Saritha Kodikara"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+# Introduction
+
+This document describes the analysis of oral microbial signatures in head and neck cancer patients, focusing on their longitudinal disease severity patterns. The analysis includes nonnegative PCA to derive a well-being score, clustering of patient curves, and linear mixed models to identify significant microbial features associated with disease severity.
+
+```{r}
+# Load required packages
+local_lib <- file.path(getwd(), "libs", paste0("R-", getRversion()[, 1], ".", getRversion()[, 2]))
+if (dir.exists(local_lib)) {
+  .libPaths(c(local_lib, .libPaths()))
+}
+
+suppressPackageStartupMessages(library(PhiSpace))
+suppressPackageStartupMessages(library(vizOmics))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(magrittr))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(seriation))
+suppressPackageStartupMessages(library(cluster))
+suppressPackageStartupMessages(library(matrixStats))
+suppressPackageStartupMessages(library(nlme))
+suppressPackageStartupMessages(library(circlize))
+
+# Load custom functions
+source("0.utils.R")
+
+required_input_files <- c("data_filtered/meta_filtered.csv")
+required_method_packages <- c("nsprcomp")
+if (!result_exists("output/plsko/global.rds") || !result_exists("output/plsko/group_list.rds")) {
+  required_method_packages <- c(required_method_packages, "PLSKO")
+}
+required_cache_packages <- character()
+cached_plsko_paths <- c("output/plsko/global.qs", "output/plsko/group_list.qs")
+if (
+  any(file.exists(cached_plsko_paths)) &&
+  any(!file.exists(sub("\\.qs$", ".rds", cached_plsko_paths))) &&
+  !"PLSKO" %in% required_method_packages
+) {
+  required_cache_packages <- c(required_cache_packages, "qs")
+}
+missing_method_packages <- required_method_packages[
+  !vapply(required_method_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+missing_cache_packages <- required_cache_packages[
+  !vapply(required_cache_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+missing_input_files <- required_input_files[!file.exists(required_input_files)]
+if (
+  length(missing_input_files) > 0 ||
+  length(missing_method_packages) > 0 ||
+  length(missing_cache_packages) > 0
+) {
+  msg <- character()
+  if (length(missing_input_files) > 0) {
+    msg <- c(
+      msg,
+      "Missing required analysis input files:",
+      paste0("  - ", missing_input_files)
+    )
+  }
+  if (length(missing_method_packages) > 0) {
+    msg <- c(
+      msg,
+      "Missing required method package(s):",
+      paste0("  - ", missing_method_packages)
+    )
+  }
+  if (length(missing_cache_packages) > 0) {
+    msg <- c(
+      msg,
+      "Missing package(s) needed to read cached results:",
+      paste0("  - ", missing_cache_packages)
+    )
+  }
+  next_steps <- character()
+  if (length(missing_input_files) > 0) {
+    next_steps <- c(next_steps, "restore the Analysis/data and Analysis/data_filtered folders")
+  }
+  if (length(missing_method_packages) > 0) {
+    next_steps <- c(next_steps, "install the missing method packages")
+  }
+  if (length(missing_cache_packages) > 0) {
+    next_steps <- c(next_steps, "install the cached-result reader packages or regenerate cached results as .rds files")
+  }
+  stop(
+    paste(msg, collapse = "\n"),
+    "\nPlease ",
+    paste(next_steps, collapse = " and "),
+    " before rerunning the full analysis.",
+    call. = FALSE
+  )
+}
+```
+
+
+# Load data
+
+```{r}
+require_analysis_files(c("data_filtered/meta_filtered.csv"))
+
+metaDat <- read.csv(
+  paste0("data_filtered/meta_filtered.csv"), row.names = 1
+)
+metaDat <- metaDat %>% 
+  select(
+    c(id, distress:teeth, timepoint)
+  )
+```
+
+
+# Calibrated OM score summarising all relevant symptoms.
+
+Only two symptoms had missing values (i.e. taste, distress), so we impute them with the mean of the respective column. We first double-centered the data. That is, we first row-center $X$ and then column-center it so that the double-centered version has zero row means and column means. We conducted the row-centering to the usually column-centering, so that different patients' ratings at different time points were more comparable.
+
+```{r}
+X <- metaDat %>% select(distress:teeth) %>% as.matrix()
+for(icol in which(colSums(is.na(X)) > 0)){
+  icolVals <- X[,icol]
+  X[is.na(icolVals), icol] <- mean(icolVals, na.rm = T)
+}
+sum(is.na(X))
+Xcent <- PhiSpace::doubleCent(X)
+```
+
+To summarize patients' symptom ratings, we conducted non-negative sparse principal component analysis (NSPCA) of the double-centered version of $X$. We used NSPCA instead of conventional PCA since NSPCA ensures that the principal component (PC) loadings to be nonnegative and sparse, which provides more biological interpretability. 
+
+```{r}
+# perform non-negative sparse PCA
+set.seed(8790)
+npcaRes0 <- nsprcomp::nsprcomp(Xcent, center = F, nneg = T)
+npcaRes <- list(
+  scores = npcaRes0$x, loadings = npcaRes0$rotation
+)
+
+# Sensitivity score without row-centering: column-centered NSPCA only.
+X_colcenter <- scale(X, center = TRUE, scale = FALSE)
+set.seed(8790)
+npcaRes_colcenter0 <- nsprcomp::nsprcomp(X_colcenter, center = F, nneg = T)
+npcaRes_colcenter <- list(
+  scores = npcaRes_colcenter0$x, loadings = npcaRes_colcenter0$rotation
+)
+```
+
+
+```{r}
+# Visualise the results
+vizOmics::matrixPlot(npcaRes$scores, comp_idx = 1:5, colBy = metaDat$mucositis, compName = "PC", returnPlotList = F)
+vizOmics::matrixPlot(npcaRes$scores, comp_idx = 1:5, colBy = metaDat$timepoint, compName = "PC", returnPlotList = F)
+loadBarplot_v2(npcaRes$loadings, comp = "PC1", nfeat = 10)
+loadBarplot_v2(npcaRes$loadings, comp = "PC2")
+loadBarplot_v2(npcaRes$loadings, comp = "PC3")
+```
+
+
+```{r}
+# Save the figures for paper
+p <- vizOmics::matrixPlot(
+  npcaRes$scores, comp_idx = 1:2, colBy = metaDat$mucositis, compName = "PC", 
+  returnPlotList = F, pointSize = 1, fsize = 7, legendTitle = ""
+)
+png(
+  paste0("figs/P12_legend.png"),
+  width = 2, height = 0.5, units = "in", res = 300
+)
+op <- par(mar = rep(0, 4))
+suppressWarnings(grid::grid.draw(get_legend(p + theme(legend.position = "top"))))
+par(op)
+dev.off()
+ggsave(
+  paste0("figs/PC12.png"), p + theme(legend.position = "none"), width = 3, height = 2.5
+)
+p <- vizOmics::matrixPlot(
+  npcaRes$scores, comp_idx = 1, colBy = metaDat$mucositis, compName = "PC", 
+  returnPlotList = F, pointSize = 1, fsize = 7, legendTitle = ""
+)
+ggsave(
+  paste0("figs/P1.png"), p + theme(legend.position = "none"), width = 3, height = 1.5
+)
+p <- loadBarplot_v2(npcaRes$loadings, comp = "PC1", nfeat = 8, fsize = 8)
+ggsave(
+  paste0("figs/P1_load.png"), p, width = 2.5, height = 3
+)
+```
+
+
+After examining the loadings of PC1--PC5, we chose the PC1 as the calibrated OM score for the following reasons. First, PC1 is positively correlated with the calibrated OM score. Moreover, PC1 summarises 7 different symptoms pertaining to OM, and hence provides a more comprehensive evaluation of calibrated OM score.
+
+```{r}
+metaDat[,"OMscore_calib"] <- npcaRes$scores[,"PC1"]
+metaDat[,"OMscore_colcenter"] <- npcaRes_colcenter$scores[,"PC1"]
+```
+
+```{r}
+# Validation outputs for Reviewer 3 comment 1
+dir.create("output/score_validation", recursive = TRUE, showWarnings = FALSE)
+
+pc1_variance_explained <- npcaRes0$sdev[1]^2 / sum(npcaRes0$sdev^2)
+pc1_colcenter_variance_explained <- npcaRes_colcenter0$sdev[1]^2 / sum(npcaRes_colcenter0$sdev^2)
+raw_symptom_mean <- rowMeans(X)
+
+score_validation_summary <- tibble::tibble(
+  metric = c(
+    "double_centered_PC1_variance_explained",
+    "column_centered_PC1_variance_explained",
+    "cor_double_centered_PC1_with_mucositis_item",
+    "cor_column_centered_PC1_with_mucositis_item",
+    "cor_double_centered_PC1_with_column_centered_PC1",
+    "cor_raw_symptom_mean_with_double_centered_PC1",
+    "cor_raw_symptom_mean_with_column_centered_PC1"
+  ),
+  value = c(
+    pc1_variance_explained,
+    pc1_colcenter_variance_explained,
+    cor(metaDat$OMscore_calib, metaDat$mucositis, use = "complete.obs"),
+    cor(metaDat$OMscore_colcenter, metaDat$mucositis, use = "complete.obs"),
+    cor(metaDat$OMscore_calib, metaDat$OMscore_colcenter, use = "complete.obs"),
+    cor(raw_symptom_mean, metaDat$OMscore_calib, use = "complete.obs"),
+    cor(raw_symptom_mean, metaDat$OMscore_colcenter, use = "complete.obs")
+  )
+)
+write.csv(score_validation_summary, "output/score_validation/score_validation_summary.csv", row.names = FALSE)
+score_validation_summary
+
+patient_response_tendency <- metaDat %>%
+  mutate(raw_symptom_mean = raw_symptom_mean) %>%
+  group_by(id) %>%
+  summarise(
+    patient_mean_raw_symptoms = mean(raw_symptom_mean, na.rm = TRUE),
+    patient_mean_double_centered_PC1 = mean(OMscore_calib, na.rm = TRUE),
+    patient_mean_column_centered_PC1 = mean(OMscore_colcenter, na.rm = TRUE),
+    patient_max_mucositis_item = max(mucositis, na.rm = TRUE),
+    .groups = "drop"
+  )
+write.csv(patient_response_tendency, "output/score_validation/patient_response_tendency.csv", row.names = FALSE)
+
+response_tendency_summary <- tibble::tibble(
+  metric = c(
+    "patient_level_cor_raw_tendency_with_double_centered_PC1",
+    "patient_level_cor_raw_tendency_with_column_centered_PC1",
+    "patient_level_cor_raw_tendency_with_max_mucositis_item"
+  ),
+  value = c(
+    cor(patient_response_tendency$patient_mean_raw_symptoms,
+        patient_response_tendency$patient_mean_double_centered_PC1,
+        use = "complete.obs"),
+    cor(patient_response_tendency$patient_mean_raw_symptoms,
+        patient_response_tendency$patient_mean_column_centered_PC1,
+        use = "complete.obs"),
+    cor(patient_response_tendency$patient_mean_raw_symptoms,
+        patient_response_tendency$patient_max_mucositis_item,
+        use = "complete.obs")
+  )
+)
+write.csv(response_tendency_summary, "output/score_validation/response_tendency_summary.csv", row.names = FALSE)
+response_tendency_summary
+
+p <- ggplot(metaDat, aes(x = OMscore_colcenter, y = OMscore_calib)) +
+  geom_point(alpha = 0.35, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Column-centered PC1",
+    y = "Double-centered PC1"
+  ) +
+  theme_bw(base_size = 8)
+ggsave("figs/score_double_vs_column_centered.png", p, width = 3, height = 2.5)
+
+p <- ggplot(
+  metaDat %>% mutate(raw_symptom_mean = raw_symptom_mean),
+  aes(x = raw_symptom_mean, y = OMscore_calib)
+) +
+  geom_point(alpha = 0.35, size = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = "Raw mean symptom rating per observation",
+    y = "Double-centered PC1"
+  ) +
+  theme_bw(base_size = 8)
+ggsave("figs/score_vs_raw_response_level.png", p, width = 3, height = 2.5)
+```
+
+```{r}
+# Visualise the calibrated OM score
+metaDat <- metaDat %>% distinct(id, timepoint, .keep_all = TRUE) 
+ggplot(metaDat, aes(x = timepoint, y = OMscore_calib)) +
+  geom_line(aes(group = id), colour = "gray") + 
+  geom_smooth() +
+  labs(x = "Day", y = "Disease severity score") + 
+  theme_bw(base_size = 5)
+ggsave("figs/allCurves.png", width = 3, height = 2.5)
+```
+
+# Identifying patient groups according to calibrated OM score.
+
+For each patient at their respective observational time points, we used a functional data analysis approach to group the patients according to the longitudinal patterns of their calibrated OM scores. 
+
+For the $i$th patient we linearly interpolated the patient's observed calibrated OM scores at discrete time points to obtain the patient's calibrated OM score function as $f_i(t)$ for $t\in[\tau_i, T_i]$, where $\tau_i$ and $T_i$ the minimum (baseline) and maximum (discharge) time points of patient $i$. We avoided extrapolating $f_i$ outside its observational time range to retain the original baseline and discharge time points of patients.
+
+```{r}
+# Interpolate calibrated OM scores at discrete time points
+timeGrid <- seq(
+  min(metaDat$timepoint), max(metaDat$timepoint), 0.5
+)
+metaList <- split(metaDat, ~id)
+interpVals <- lapply(
+  1:length(metaList),
+  function(ii){
+    subDF <- metaList[[ii]]
+    modPred <- approx(
+      x = subDF$timepoint, y = subDF[,"OMscore_calib"], xout = timeGrid, 
+    )
+    return(modPred)
+  }
+) %>% `names<-`(names(metaList))
+X <- sapply(
+  interpVals, function(x) x$y
+) %>% t()
+```
+
+
+We then calculated the pairwise distances between the patient's calibrated OM score functions and found the number of clusters to be $3$ based on the gap statistic.
+
+```{r}
+distM <- distMiss(X)
+X2clust <- as.matrix(distM)
+
+#number of clusters according to Gap statistics
+set.seed(8790)
+```
+```{r}
+# From the plot, we choose k = 3  
+
+plot_nbclust_custom(X2clust, method = "gap_stat")
+ggsave("figs/gap_stat.png", width = 4, height = 3)
+```
+
+```{r}
+
+plot_nbclust_custom(X2clust, method = "silhouette") 
+ggsave("figs/silhouette_stat.png", width = 4, height = 3)
+```
+
+```{r}
+
+plot_nbclust_custom(X2clust, method = "wss")
+ggsave("figs/wss_stat.png", width = 4, height = 3)
+```
+
+```{r}
+#visualise the calibrated OM score trajectories for each cluster
+set.seed(8475)
+hc <- hclust(dist(X2clust), method = "ward.D2")
+plot(as.dendrogram(hc), main = "Dendrogram of Rows", xlab = "Rows", ylab = "Height")
+k <- 3
+clusters <- cutree(hc, k = k)
+df <- X2clust %>% as.data.frame() %>% mutate(id = rownames(X2clust), cluster = as.factor(clusters))
+metaDat_c <- merge(metaDat, df[,c("id", "cluster")], by = "id")
+cluster_counts <- table(df$cluster)
+cluster_labels <- paste0(names(cluster_counts), " (n=", as.integer(cluster_counts), ")")
+ggplot(metaDat_c, aes(x = timepoint, y = OMscore_calib, color = cluster, group = id)) +
+    geom_line(linewidth = 0.3) + 
+    labs( x = "Day", y = "Disease severity score") +
+    theme_bw(base_size = 5) +
+    theme(
+        legend.title = element_text(face = "bold", size=9),
+        legend.text=element_text(size=8)
+    ) +
+    scale_color_manual(labels = cluster_labels, values = analysis_palette(length(cluster_counts))) 
+ggsave("figs/curvesCluster.png", width = 3.5, height = 2.5)
+ggplot(metaDat_c, aes(x = timepoint, y = OMscore_calib, color = cluster, group = id)) +
+  geom_line() + 
+  labs( x = "Day", y = "Disease severity score") +
+  theme_bw(base_size = 5)+
+  facet_wrap(~ cluster)+
+    scale_color_manual(values = analysis_palette(length(cluster_counts))) 
+  
+metaDat_c%>% select(id, cluster) %>% unique()%>%select(cluster)%>%table()
+
+write.csv(
+  metaDat_c %>% select(id, cluster) %>% distinct(),
+  "output/score_validation/round4_cluster_assignments_from_render.csv",
+  row.names = FALSE
+)
+
+patient_trajectory_summary <- metaDat_c %>%
+  arrange(id, timepoint) %>%
+  group_by(cluster, id) %>%
+  summarise(
+    n_observations = n(),
+    baseline_day = min(timepoint, na.rm = TRUE),
+    last_day = max(timepoint, na.rm = TRUE),
+    baseline_score = OMscore_calib[which.min(timepoint)],
+    mean_score_day0_20 = mean(OMscore_calib[timepoint >= 0 & timepoint <= 20], na.rm = TRUE),
+    mean_score_day20_40 = mean(OMscore_calib[timepoint > 20 & timepoint <= 40], na.rm = TRUE),
+    max_score = max(OMscore_calib, na.rm = TRUE),
+    .groups = "drop"
+  )
+write.csv(
+  patient_trajectory_summary,
+  "output/score_validation/round4_patient_trajectory_summary_from_render.csv",
+  row.names = FALSE
+)
+
+trajectory_summary <- patient_trajectory_summary %>%
+  group_by(cluster) %>%
+  summarise(
+    n_patients = n(),
+    n_observations = sum(n_observations),
+    mean_baseline_score = mean(baseline_score, na.rm = TRUE),
+    mean_score_day0_20 = mean(mean_score_day0_20, na.rm = TRUE),
+    mean_score_day20_40 = mean(mean_score_day20_40, na.rm = TRUE),
+    mean_max_score = mean(max_score, na.rm = TRUE),
+    median_last_day = median(last_day, na.rm = TRUE),
+    .groups = "drop"
+  )
+write.csv(
+  trajectory_summary,
+  "output/score_validation/round4_cluster_trajectory_summary_from_render.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# Sensitivity analysis for score preprocessing: repeat trajectory clustering
+# using the column-centered-only NSPCA score.
+cluster_sensitivity <- cluster_om_trajectories(
+  meta_dat = metaDat,
+  score_col = "OMscore_colcenter",
+  k = 3,
+  grid_step = 0.5
+)
+
+cluster_compare <- tibble::tibble(
+  id = names(clusters),
+  double_centered_cluster = as.factor(clusters),
+  column_centered_cluster = as.factor(cluster_sensitivity$clusters[names(clusters)])
+)
+
+cluster_contingency <- as.data.frame.matrix(
+  table(
+    double_centered = cluster_compare$double_centered_cluster,
+    column_centered = cluster_compare$column_centered_cluster
+  )
+)
+cluster_contingency <- tibble::rownames_to_column(cluster_contingency, "double_centered_cluster")
+write.csv(
+  cluster_contingency,
+  "output/score_validation/cluster_contingency_double_vs_column_centered.csv",
+  row.names = FALSE
+)
+
+cluster_sensitivity_summary <- tibble::tibble(
+  metric = c(
+    "adjusted_rand_index_double_vs_column_centered_clusters",
+    "n_patients_compared"
+  ),
+  value = c(
+    adjusted_rand_index(
+      cluster_compare$double_centered_cluster,
+      cluster_compare$column_centered_cluster
+    ),
+    nrow(cluster_compare)
+  )
+)
+write.csv(
+  cluster_sensitivity_summary,
+  "output/score_validation/cluster_sensitivity_summary.csv",
+  row.names = FALSE
+)
+write.csv(
+  cluster_compare,
+  "output/score_validation/cluster_assignments_double_vs_column_centered.csv",
+  row.names = FALSE
+)
+cluster_sensitivity_summary
+cluster_contingency
+
+cluster_compare_long <- cluster_compare %>%
+  tidyr::pivot_longer(
+    cols = c(double_centered_cluster, column_centered_cluster),
+    names_to = "score_preprocessing",
+    values_to = "cluster"
+  )
+p <- ggplot(cluster_compare_long, aes(x = score_preprocessing, fill = cluster)) +
+  geom_bar(position = "stack") +
+  labs(x = NULL, y = "Number of patients") +
+  theme_bw(base_size = 8) +
+  scale_fill_manual(values = analysis_palette(length(unique(cluster_compare_long$cluster))))
+ggsave("figs/cluster_sensitivity_double_vs_column_centered.png", p, width = 3, height = 2.5)
+```
+
+## Testing for differences in duration of follow-up across patient clusters
+```{r}
+duration_df <- metaDat_c %>%
+    group_by(id) %>%
+    reframe(
+        end_time = max(timepoint, na.rm = TRUE),
+        duration = max(timepoint, na.rm = TRUE) - min(timepoint, na.rm = TRUE),
+        cluster = cluster
+    )%>% unique()
+
+duration_df$cluster <- factor(duration_df$cluster)
+
+```
+
+```{r}
+## ----------------------------
+## Pairwise Wilcoxon test
+## ----------------------------
+pw <- pairwise.wilcox.test(
+  duration_df$duration,
+  duration_df$cluster,
+  p.adjust.method = "BH",
+  exact = FALSE
+)
+pw
+```
+```{r}
+## ----------------------------
+## Plot with p-value annotations
+## ----------------------------
+pvals_df <- as.data.frame(pw$p.value) %>%
+  rownames_to_column("group1") %>%
+  pivot_longer(
+    cols = -group1,
+    names_to = "group2",
+    values_to = "p.adj"
+  ) %>%
+  filter(!is.na(p.adj))
+
+y_max <- max(duration_df$duration, na.rm = TRUE)
+
+pvals_df <- pvals_df %>%
+  mutate(
+    y.position = y_max * (1.05 + 0.1 * row_number()),
+    #label = paste0("p = ", signif(p.adj, 2))
+    label= case_when(
+              p.adj < 0.001 ~ "***",
+              p.adj < 0.01  ~ "**",
+              p.adj < 0.05  ~ "*",
+               TRUE          ~ "ns")
+  )
+
+
+ggplot(duration_df, aes(x = cluster, y = duration)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  stat_pvalue_manual(
+    pvals_df,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position"
+  ) +
+  labs(
+    x = "Cluster",
+    y = "Observation duration (days)"
+  ) +
+  theme_minimal()
+ggsave("figs/boxplots_duration.png", width = 5, height = 4)
+```
+
+## Sensitivity of clustering if we cut the curves at day 48
+
+```{r}
+summary(duration_df$end_time)
+#duration_df%>%filter(cluster==3)%>%summarise(median=median(duration))
+
+
+#histogram of end time  with mean as a line
+median_end_time <- median(duration_df$end_time)
+ggplot(duration_df, aes(x = end_time)) +
+  geom_histogram(binwidth = 5, fill = "lightblue", color = "grey") +
+  geom_vline(
+    xintercept = median_end_time,
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  annotate(
+    "text",
+    x = median_end_time,
+    y = Inf,
+    label = paste0("Median = ", round(median_end_time, 1)),
+    vjust = 1.5,
+    hjust = -0.1,
+    color = "black"
+  ) +
+  labs(
+    x = "Last time point (days)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+ggsave("figs/histogram_last_timepoint.png", width = 4, height = 3)
+```
+```{r}
+
+# Cut the curves at day 48
+X_cut <- X[,1:which(timeGrid == 41)]
+
+distM_new <- distMiss(X_cut)
+X2clust_new <- as.matrix(distM_new)
+
+
+k <- 3
+clusters_new <- cutree(hclust(dist(X2clust_new), method = "ward.D2"), k = k)
+table(clusters, clusters_new)
+```
+
+
+# Identifying underlying patient characteristics that are driving patient groups
+
+To investigate whether specific clinical features contributed to differences between patient groups, we first visualized marginal density plots for relevant variables such as age, weight, and BMI. Where visual differences between groups were apparent, we performed two-sample t-tests to formally assess differences across cluster combinations. Assumptions of normality and homogeneity of variance were checked prior to conducting the tests.
+
+```{r message=FALSE}
+# Load patient characteristics
+require_analysis_files(c("data/age_final_data.csv"))
+clFeat <- readr::read_csv("data/age_final_data.csv", show_col_types = FALSE)
+clFeat <- merge(df[,c("id","cluster")], clFeat, by = "id", all.x = TRUE)
+```
+
+```{r}
+clFeat$cluster <- as.factor(clFeat$cluster)
+clFeat$bmi <- clFeat$weight/clFeat$heightnew^2
+table(clFeat$cluster)
+clFeat %>% group_by(cluster) %>% summarise_all(mean, na.rm = TRUE)
+
+demographic_table_values <- clFeat %>%
+  group_by(cluster) %>%
+  summarise(
+    n_cluster = n_distinct(id),
+    n_demographic_available = sum(!is.na(age)),
+    age_mean = mean(age, na.rm = TRUE),
+    age_sd = sd(age, na.rm = TRUE),
+    male = sum(sex == 2, na.rm = TRUE),
+    female = sum(sex == 1, na.rm = TRUE),
+    non_hispanic_white = sum(race___1 == 1, na.rm = TRUE),
+    other_ethnicity = sum(race___1 != 1 & !is.na(age), na.rm = TRUE),
+    weight_mean = mean(weight, na.rm = TRUE),
+    weight_sd = sd(weight, na.rm = TRUE),
+    height_mean = mean(heightnew, na.rm = TRUE),
+    height_sd = sd(heightnew, na.rm = TRUE),
+    .groups = "drop"
+  )
+write.csv(
+  demographic_table_values,
+  "output/score_validation/round4_demographic_table_values.csv",
+  row.names = FALSE
+)
+write.csv(
+  clFeat %>% filter(is.na(age)) %>% select(id, cluster),
+  "output/score_validation/round4_demographic_missing_ids.csv",
+  row.names = FALSE
+)
+demographic_table_values
+```
+
+
+```{r}
+table(clFeat$cluster)
+
+clFeat %>% ggplot(aes(age)) + geom_density(aes(colour = cluster),show.legend = FALSE)+ 
+  theme_bw(base_size = 7)+
+    scale_color_manual(values = analysis_palette(length(cluster_counts))) 
+ggsave("figs/age.png", width = 3, height = 2.5)
+
+clFeat %>% ggplot(aes(weight)) + geom_density(aes(colour = cluster),show.legend = FALSE)+
+  theme_bw(base_size = 7)+
+    scale_color_manual(values = analysis_palette(length(cluster_counts))) 
+ggsave("figs/weight.png", width = 3, height = 2.5)
+
+
+clFeat %>% ggplot(aes(bmi)) + geom_density(aes(colour = cluster), show.legend = FALSE)+ 
+  theme_bw(base_size = 7)+
+    scale_color_manual(values = analysis_palette(length(cluster_counts))) 
+
+```
+
+```{r}
+# Age- (pvalue 0.04682)
+data1 <- clFeat$age[clFeat$cluster == 1]
+data2 <- clFeat$age[clFeat$cluster == 2]
+  # Normality ( pvalues 0.857, 0.3249)
+  shapiro.test(data1);shapiro.test(data2)
+  # Equal variance (pvalue 0.927)
+  var.test(data1, data2)
+t.test(data1, data2, var.equal = T, alternative = "greater")
+
+```
+```{r}
+# Age- (pvalue 0.1907)
+data1 <- clFeat$age[clFeat$cluster == 1]
+data2 <- clFeat$age[clFeat$cluster == 3]
+  # Normality ( pvalues 0.857, 0.3533)
+  shapiro.test(data1);shapiro.test(data2)
+  # Equal variance (pvalue 0.746)
+  var.test(data1, data2)
+t.test(data1, data2, var.equal = T, alternative = "greater")
+
+```
+```{r}
+# Age- (pvalue 0.8364)
+data1 <- clFeat$age[clFeat$cluster == 2]
+data2 <- clFeat$age[clFeat$cluster == 3]
+  # Normality ( pvalues 0.3249, 0.3533)
+  shapiro.test(data1);shapiro.test(data2)
+  # Equal variance (pvalue 0.788)
+  var.test(data1, data2)
+t.test(data1, data2, var.equal = T, alternative = "greater")
+
+```
+
+```{r}
+# Weight (pvalue 0.02683)
+data1 <- clFeat$weight[clFeat$cluster == 1]
+data2 <- clFeat$weight[clFeat$cluster == 2]
+  # Normality ( pvalues 0.1304, 0.4293)
+  shapiro.test(data1);shapiro.test(data2)
+  # Equal variance (pvalue 0.7883)
+  var.test(data1, data2)
+t.test(data1, data2, var.equal = T, alternative = "less")
+```
+```{r}
+# Weight (pvalue 0.03713)
+data1 <- clFeat$weight[clFeat$cluster == 1]
+data2 <- clFeat$weight[clFeat$cluster == 3]
+  # Normality ( pvalues 0.1304, 0.006892)
+  shapiro.test(data1);shapiro.test(data2)
+  # Equal variance (pvalue 0.2749)
+  var.test(data1, data2)
+t.test(data1, data2, var.equal = T, alternative = "less")
+```
+```{r}
+# Weight (pvalue 0.6888)
+data1 <- clFeat$weight[clFeat$cluster == 2]
+data2 <- clFeat$weight[clFeat$cluster == 3]
+  # Normality ( pvalues 0.4293, 0.006892)
+  shapiro.test(data1);shapiro.test(data2)
+  # Equal variance (pvalue 0.3523)
+  var.test(data1, data2)
+t.test(data1, data2, var.equal = T, alternative = "less")
+```
+
+
+
+```{r}
+# Investigate the relationship between calibrated OM score and age, weigh
+medOMscore_calib <- metaDat_c %>% group_by(id) %>% summarise(medOMscore_calib = median(OMscore_calib))
+clFeat <- merge(medOMscore_calib, clFeat, by = "id")
+clFeat %>% ggplot(aes(medOMscore_calib, weight)) + geom_line()
+clFeat %>% ggplot(aes(medOMscore_calib, age)) + geom_line()
+```
+
+
+
+# Identifying microbial features associated with calibrated OM score.
+
+To identify microbial features associated with calibrated OM scores, we used a novel variable selection method, partial least squares knockoff (PLSKO). PLSKO is a knock-off variable selection method based on PLS regression. We opted for a knock-off-based approach for variable selection since knock-off approaches provide statistically principled false discovery control, whereas alternative methods such as lasso and sparse PLS lack. We first applied PLSKO to the whole dataset to identify OTUs correlated with the calibrated OM score across all patients. Then, we applied PLSKO to each individual cluster of patients to uncover group-specific OTUs. 
+
+```{r}
+# Prepare data
+require_analysis_files(c(
+  "data/taxonomy_table.csv",
+  "data_filtered/sce_all.rds",
+  "data_filtered/selectedOTUs.rds"
+))
+taxonomy_table <- read.csv("data/taxonomy_table.csv", 
+  row.names = 1
+)
+microb <- readRDS("data_filtered/sce_all.rds")
+selectedOTU <- readRDS("data_filtered/selectedOTUs.rds")
+microb <- microb[selectedOTU, ]
+microb <- PhiSpace::CLRnorm(microb)
+# Add cluster labels
+colData(microb)[,"cluster"] <- df[microb$id, "cluster"]
+```
+
+```{r}
+## PLSKO
+patientIDs <- intersect(rownames(metaDat), colnames(microb))
+X <- t(assay(microb, "data"))[patientIDs,] %>% as.matrix()
+Y <- metaDat[patientIDs,"OMscore_calib"]
+plskoRes_global_path <- "output/plsko/global.qs"
+if(!result_exists(plskoRes_global_path)){
+  plsResAKO <- PLSKO::plsAKO(X, Y, ncores = 5, seed = 7639)
+  save_result(plsResAKO, plskoRes_global_path)
+} else {
+  plsResAKO <- read_result(plskoRes_global_path)
+}
+sel <- names(plsResAKO$ako.s)
+genera <- taxonomy_table[sel,"genus"]
+OTUids <- gsub("OTU", "", sel)
+sig <- paste0(genera, OTUids)
+plsRes <- PhiSpace::mvr(X, Y, ncomp = 2, method = "PLS", center = T)
+```
+
+```{r}
+impScores <- plsRes$coefficients[,,2]
+load2plot <- impScores %>% as.matrix() %>% as.data.frame() %>% `colnames<-`("coef")
+genera <- taxonomy_table[rownames(load2plot),"genus"]
+OTUids <- gsub("OTU", "", rownames(load2plot))
+rownames(load2plot) <- paste0(genera, OTUids)
+p <- loadBarplot_v2(load2plot, comp = "coef", significant=sig, nfeat = 30, fsize = 7)
+p
+ggsave("figs/coefPlot_global.png", width = 1.8, height = 2.5)
+knockoff_ls<-list(data.frame(taxa=sig,positive=as.numeric(load2plot[sig,]>0)))
+```
+
+
+```{r}
+plskoRes_group_path <- "output/plsko/group_list.qs"
+dummy <- PhiSpace::codeY_vec(metaDat_c$cluster, rowNames = metaDat_c$id, method = "0,1")
+nclust <- ncol(dummy)
+if(!result_exists(plskoRes_group_path)){
+  
+  groupPLSKOres <- lapply(
+    1:nclust, function(ii){
+      patientClust <- metaDat_c$id[metaDat_c$cluster == ii]
+      microbSub <- microb[,microb$id %in% patientClust]
+      patientIDs <- intersect(rownames(metaDat), colnames(microbSub))
+      X <- t(assay(microb, "data"))[patientIDs,] %>% as.matrix()
+      X <- X[,colVars(X)>1e-10]
+      Y <- metaDat[patientIDs,"OMscore_calib"]
+      
+      plsRes <- PLSKO::plsAKO(X, Y, ncores = 5, seed = 7639)
+      sel <- names(plsRes$ako.s)
+      genera <- taxonomy_table[sel,"genus"]
+      OTUids <- gsub("OTU", "", sel)
+      
+      return(paste0(genera, OTUids))
+    }
+  )
+  save_result(groupPLSKOres, plskoRes_group_path)
+} else {
+  
+  groupPLSKOres <- read_result(plskoRes_group_path)
+}
+```
+
+```{r}
+groupPLSres <- lapply(
+  1:nclust, function(ii){
+    patientClust <- metaDat_c$id[metaDat_c$cluster == ii]
+    microbSub <- microb[,microb$id %in% patientClust]
+    patientIDs <- intersect(rownames(metaDat), colnames(microbSub))
+    X <- t(assay(microb, "data"))[patientIDs,] %>% as.matrix()
+    X <- X[,colVars(X)>1e-10]
+    Y <- metaDat[patientIDs,"OMscore_calib"]
+    
+    plsRes <- PhiSpace::mvr(X, Y, ncomp = 2, method = "PLS", center = T)
+    impScores <- plsRes$coefficients[,,2]
+    load2plot <- impScores %>% as.matrix() %>% as.data.frame() %>% `colnames<-`("coef")
+    genera <- taxonomy_table[rownames(load2plot),"genus"]
+    OTUids <- gsub("OTU", "", rownames(load2plot))
+    rownames(load2plot) <- paste0(genera, OTUids)
+    sig<-groupPLSKOres[[ii]]
+    knockoff_ls[[1+ii]]<<-data.frame(taxa=sig,positive=as.numeric(load2plot[sig,]>0))
+    loadBarplot_v2(load2plot, comp = "coef", significant=sig, nfeat = 30, fsize = 7)
+  }
+)
+p <- ggarrange(plotlist = groupPLSres, nrow = 1)
+p
+ggsave("figs/coefPlot_group.png", width = 5.6, height = 2.5)
+```
+
+
+```{r}
+# Combine knockoff_ls into a named list
+knock_ls <- list(
+  All = knockoff_ls[[1]],
+  C1 = knockoff_ls[[2]],
+  C2 = knockoff_ls[[3]],
+  C3 = knockoff_ls[[4]]
+)
+
+# Get all unique taxa
+all_taxa <- unique(unlist(lapply(knock_ls, function(x) x$taxa)))
+
+# Create a matrix of values: 1 (positive), 0 (negative), NA (not selected)
+taxa_matrix <- sapply(knock_ls, function(df) {
+  out <- rep(NA, length(all_taxa))
+  names(out) <- all_taxa
+  out[df$taxa] <- df$positive
+  out
+})
+
+# Reorder rows by same sorting logic
+taxa_matrix <- taxa_matrix[order(
+  -rowSums(taxa_matrix),
+  -taxa_matrix[, "All"],
+  -taxa_matrix[, "C1"],
+  -taxa_matrix[, "C2"],
+  -taxa_matrix[, "C3"]
+), ]
+
+write.csv(
+  taxa_matrix %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("taxon"),
+  "output/score_validation/round4_selected_taxa_direction_table.csv",
+  row.names = FALSE
+)
+
+png(filename = "figs/clusterTable.png",
+width=7, height=6, units="in", res=150)
+pheatmap::pheatmap(taxa_matrix,
+                   color = c("#0000FF80", "#FF000080"),
+                   legend_breaks = c(0, 1),
+                   legend_labels = c("Negative", "Positive"),
+                   cluster_rows = FALSE,
+                   cluster_cols = FALSE,
+                   fontsize_row = 12,
+                   border_color = "white",
+                   na_col = "white" )
+dev.off()
+```
+
+# Identifying patient characteristics that are associated with microbial abundance.
+ 
+To investigate whether patient characteristics (such as age, height, and weight) and other factors (such as Timepoint and patient Cluster membership) were associated with microbial abundance, we applied linear mixed models (LMMs). LMMs extend standard linear models by including both fixed effects and random effects, making them particularly suitable for repeated-measures studies like this, which involve multiple observations from the same patient. In our models, age, height, weight, timepoint, and cluster were treated as fixed effects, while patients were modelled as random effects to account for dependencies in the data. We fitted separate LMMs for each taxon previously identified by PLSKO analysis as associated with the calibrated OM score, using CLR-transformed microbial abundance as the response variable.
+
+```{r}
+
+patientIDs <- intersect(rownames(metaDat), colnames(microb))
+X <- t(assay(microb, "data"))[patientIDs,] %>% as.matrix()
+colnames(X) <- paste0(taxonomy_table[colnames(X),"genus"], gsub("OTU", "", colnames(X)))
+
+rownames(metaDat_c)<- rownames(metaDat)
+microb_meta<-merge(metaDat_c[,c("id", "timepoint","cluster","OMscore_calib")],X[, all_taxa], by = "row.names")%>%
+  merge(.,clFeat[c("id","sex", "weight", "bmi" , "heightnew"  ,"age")], by="id")
+
+microb_meta$sex<-factor(microb_meta$sex, levels = c("1","2"),
+                        labels=c("Female", "Male"))
+microb_meta_lmm <- microb_meta %>%
+  filter(complete.cases(age, heightnew, weight, cluster, timepoint))
+```
+
+```{r}
+# Apply the model across all y's
+models <- lapply(rownames(taxa_matrix), function(y) {
+  formula <- as.formula(paste(y, "~ timepoint + cluster + age + heightnew + weight"))
+  lme(formula, random = ~1 | id, data = microb_meta_lmm)
+})
+```
+
+```{r}
+mat<-sapply(models, function(x){v<-summary(x)
+sign(v$tTable[-1,1])*(-log(v$tTable[-1,5]))}) %>% t()
+
+rownames(mat)<- rownames(taxa_matrix)
+```
+
+The resulting beta coefficients from these models represent the estimated effect size of each fixed effect on microbial abundance. The sign and magnitude of each beta coefficient indicate the direction and strength of the association for a given covariate (e.g., timepoint) while holding other covariates constant. To visualize these results, we plotted the values $sign(\beta)\times-log(\beta)$ in a heatmap, highlighting the most significant factors influencing microbial abundance.
+
+```{r}
+#-log(0.05)~3
+# Define custom color function
+# Define color function
+col_fun <- colorRamp2(
+  breaks = c(-100, -3, -2.9, 0, 2.9 , 3, 100),
+  colors = c("darkorange4", "lightgoldenrod1", "grey","white","grey", "thistle1", "purple4")
+)
+
+# save the heatmap
+png(filename = "figs/lmmRes.png",
+width=6, height=6, units="in", res=150)
+Heatmap(mat,
+        name = "value",
+        col = col_fun,
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_dend = FALSE,
+        show_column_dend = FALSE,
+        rect_gp = gpar(col = "white", lwd = 2))
+dev.off()
+```
+
+
+```{r}
+sessionInfo()
+```

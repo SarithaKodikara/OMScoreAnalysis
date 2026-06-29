@@ -1,0 +1,24 @@
+# Restricted study data and derived data
+data/
+data_filtered/
+output/
+figs/
+figure_panels/
+
+# Data-like and cached files must not be committed
+*.csv
+*.tsv
+*.rds
+*.RDS
+*.qs
+*.mat
+*.tre
+
+# Rendered and local environment files
+*.html
+*_files/
+libs/
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
